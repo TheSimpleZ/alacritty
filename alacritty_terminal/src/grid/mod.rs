@@ -313,9 +313,6 @@ impl<T: GridCell + Default + PartialEq + Clone> Grid<T> {
         let positions = (iter.point.line.0 + 1) as usize;
         let region = Line(0)..Line(self.lines as i32);
 
-        // Reset display offset.
-        self.display_offset = 0;
-
         // Clear the viewport.
         self.scroll_up(&region, positions);
 
@@ -376,6 +373,9 @@ impl<T> Grid<T> {
     pub fn clear_history(&mut self) {
         // Explicitly purge all lines from history.
         self.raw.shrink_lines(self.history_size());
+
+        // Reset display offset.
+        self.display_offset = 0;
     }
 
     /// This is used only for initializing after loading ref-tests.
@@ -540,7 +540,7 @@ impl Dimensions for (usize, usize) {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Indexed<T> {
     pub point: Point,
     pub cell: T,

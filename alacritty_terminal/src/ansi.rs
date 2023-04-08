@@ -1,6 +1,7 @@
 //! ANSI Terminal Stream Parsing.
 
 use std::convert::TryFrom;
+use std::fmt::Write;
 use std::time::{Duration, Instant};
 use std::{iter, str};
 
@@ -11,6 +12,7 @@ use vte::{Params, ParamsIter};
 use alacritty_config_derive::ConfigDeserialize;
 
 use crate::index::{Column, Line};
+use crate::term::cell::Hyperlink;
 use crate::term::color::Rgb;
 
 /// Maximum time before a synchronized update is aborted.
@@ -430,8 +432,8 @@ pub trait Handler {
     /// Set an indexed color value.
     fn set_color(&mut self, _: usize, _: Rgb) {}
 
-    /// Write a foreground/background color escape sequence with the current color.
-    fn dynamic_color_sequence(&mut self, _: u8, _: usize, _: &str) {}
+    /// Respond to a color query escape sequence.
+    fn dynamic_color_sequence(&mut self, _: String, _: usize, _: &str) {}
 
     /// Reset an indexed color to original value.
     fn reset_color(&mut self, _: usize) {}
@@ -456,6 +458,9 @@ pub trait Handler {
 
     /// Report text area size in characters.
     fn text_area_size_chars(&mut self) {}
+
+    /// Set hyperlink.
+    fn set_hyperlink(&mut self, _: Option<Hyperlink>) {}
 }
 
 /// Terminal cursor configuration.
@@ -697,6 +702,7 @@ pub enum NamedColor {
 }
 
 impl NamedColor {
+    #[must_use]
     pub fn to_bright(self) -> Self {
         match self {
             NamedColor::Foreground => NamedColor::BrightForeground,
@@ -721,6 +727,7 @@ impl NamedColor {
         }
     }
 
+    #[must_use]
     pub fn to_dim(self) -> Self {
         match self {
             NamedColor::Black => NamedColor::DimBlack,
@@ -768,6 +775,12 @@ pub enum Attr {
     Underline,
     /// Underlined twice.
     DoubleUnderline,
+    /// Undercurled text.
+    Undercurl,
+    /// Dotted underlined text.
+    DottedUnderline,
+    /// Dashed underlined text.
+    DashedUnderline,
     /// Blink cursor slowly.
     BlinkSlow,
     /// Blink cursor fast.
@@ -798,6 +811,8 @@ pub enum Attr {
     Foreground(Color),
     /// Set indexed background color.
     Background(Color),
+    /// Underline color.
+    UnderlineColor(Option<Color>),
 }
 
 /// Identifiers which can be assigned to a graphic character set.
@@ -837,16 +852,17 @@ impl StandardCharset {
         match self {
             StandardCharset::Ascii => c,
             StandardCharset::SpecialCharacterAndLineDrawing => match c {
+                '_' => ' ',
                 '`' => '◆',
                 'a' => '▒',
-                'b' => '\t',
-                'c' => '\u{000c}',
-                'd' => '\r',
-                'e' => '\n',
+                'b' => '\u{2409}', // Symbol for horizontal tabulation
+                'c' => '\u{240c}', // Symbol for form feed
+                'd' => '\u{240d}', // Symbol for carriage return
+                'e' => '\u{240a}', // Symbol for line feed
                 'f' => '°',
                 'g' => '±',
-                'h' => '\u{2424}',
-                'i' => '\u{000b}',
+                'h' => '\u{2424}', // Symbol for newline
+                'i' => '\u{240b}', // Symbol for vertical tabulation
                 'j' => '┘',
                 'k' => '┐',
                 'l' => '┌',
@@ -940,7 +956,7 @@ where
             for items in params {
                 buf.push('[');
                 for item in *items {
-                    buf.push_str(&format!("{:?},", *item as char));
+                    let _ = write!(buf, "{:?}", *item as char);
                 }
                 buf.push_str("],");
             }
@@ -970,17 +986,58 @@ where
 
             // Set color index.
             b"4" => {
-                if params.len() > 1 && params.len() % 2 != 0 {
-                    for chunk in params[1..].chunks(2) {
-                        let index = parse_number(chunk[0]);
-                        let color = xparse_color(chunk[1]);
-                        if let (Some(i), Some(c)) = (index, color) {
-                            self.handler.set_color(i as usize, c);
-                            return;
-                        }
+                if params.len() <= 1 || params.len() % 2 == 0 {
+                    unhandled(params);
+                    return;
+                }
+
+                for chunk in params[1..].chunks(2) {
+                    let index = match parse_number(chunk[0]) {
+                        Some(index) => index,
+                        None => {
+                            unhandled(params);
+                            continue;
+                        },
+                    };
+
+                    if let Some(c) = xparse_color(chunk[1]) {
+                        self.handler.set_color(index as usize, c);
+                    } else if chunk[1] == b"?" {
+                        let prefix = format!("4;{index}");
+                        self.handler.dynamic_color_sequence(prefix, index as usize, terminator);
+                    } else {
+                        unhandled(params);
                     }
                 }
-                unhandled(params);
+            },
+
+            // Hyperlink.
+            b"8" if params.len() > 2 => {
+                let link_params = params[1];
+
+                // NOTE: The escape sequence is of form 'OSC 8 ; params ; URI ST', where
+                // URI is URL-encoded. However `;` is a special character and might be
+                // passed as is, thus we need to rebuild the URI.
+                let mut uri = str::from_utf8(params[2]).unwrap_or_default().to_string();
+                for param in params[3..].iter() {
+                    uri.push(';');
+                    uri.push_str(str::from_utf8(param).unwrap_or_default());
+                }
+
+                // The OSC 8 escape sequence must be stopped when getting an empty `uri`.
+                if uri.is_empty() {
+                    self.handler.set_hyperlink(None);
+                    return;
+                }
+
+                // Link parameters are in format of `key1=value1:key2=value2`. Currently only key
+                // `id` is defined.
+                let id = link_params
+                    .split(|&b| b == b':')
+                    .find_map(|kv| kv.strip_prefix(b"id="))
+                    .and_then(|kv| str::from_utf8(kv).ok());
+
+                self.handler.set_hyperlink(Some(Hyperlink::new(id, uri)));
             },
 
             // Get/set Foreground, Background, Cursor colors.
@@ -1002,7 +1059,7 @@ where
                                 self.handler.set_color(index, color);
                             } else if param == b"?" {
                                 self.handler.dynamic_color_sequence(
-                                    dynamic_code,
+                                    dynamic_code.to_string(),
                                     index,
                                     terminator,
                                 );
@@ -1041,7 +1098,7 @@ where
                     return unhandled(params);
                 }
 
-                let clipboard = params[1].get(0).unwrap_or(&b'c');
+                let clipboard = params[1].first().unwrap_or(&b'c');
                 match params[2] {
                     b"?" => self.handler.clipboard_load(*clipboard, terminator),
                     base64 => self.handler.clipboard_store(*clipboard, base64),
@@ -1051,7 +1108,7 @@ where
             // Reset color index.
             b"104" => {
                 // Reset all color indexes when no parameters are given.
-                if params.len() == 1 {
+                if params.len() == 1 || params[1].is_empty() {
                     for i in 0..256 {
                         self.handler.reset_color(i);
                     }
@@ -1106,8 +1163,9 @@ where
         let mut params_iter = params.iter();
         let handler = &mut self.handler;
 
-        let mut next_param_or = |default: u16| {
-            params_iter.next().map(|param| param[0]).filter(|&param| param != 0).unwrap_or(default)
+        let mut next_param_or = |default: u16| match params_iter.next() {
+            Some(&[param, ..]) if param != 0 => param,
+            _ => default,
         };
 
         match (action, intermediates) {
@@ -1125,7 +1183,7 @@ where
             },
             ('C', []) | ('a', []) => handler.move_forward(Column(next_param_or(1) as usize)),
             ('c', intermediates) if next_param_or(0) == 0 => {
-                handler.identify_terminal(intermediates.get(0).map(|&i| i as char))
+                handler.identify_terminal(intermediates.first().map(|&i| i as char))
             },
             ('D', []) => handler.move_backward(Column(next_param_or(1) as usize)),
             ('d', []) => handler.goto_line(Line(next_param_or(1) as i32 - 1)),
@@ -1151,7 +1209,7 @@ where
             },
             ('h', intermediates) => {
                 for param in params_iter.map(|param| param[0]) {
-                    match Mode::from_primitive(intermediates.get(0), param) {
+                    match Mode::from_primitive(intermediates.first(), param) {
                         Some(mode) => handler.set_mode(mode),
                         None => unhandled!(),
                     }
@@ -1188,7 +1246,7 @@ where
             ('L', []) => handler.insert_blank_lines(next_param_or(1) as usize),
             ('l', intermediates) => {
                 for param in params_iter.map(|param| param[0]) {
-                    match Mode::from_primitive(intermediates.get(0), param) {
+                    match Mode::from_primitive(intermediates.first(), param) {
                         Some(mode) => handler.unset_mode(mode),
                         None => unhandled!(),
                     }
@@ -1316,6 +1374,9 @@ fn attrs_from_sgr_parameters(params: &mut ParamsIter<'_>) -> Vec<Option<Attr>> {
             [3] => Some(Attr::Italic),
             [4, 0] => Some(Attr::CancelUnderline),
             [4, 2] => Some(Attr::DoubleUnderline),
+            [4, 3] => Some(Attr::Undercurl),
+            [4, 4] => Some(Attr::DottedUnderline),
+            [4, 5] => Some(Attr::DashedUnderline),
             [4, ..] => Some(Attr::Underline),
             [5] => Some(Attr::BlinkSlow),
             [6] => Some(Attr::BlinkFast),
@@ -1342,13 +1403,7 @@ fn attrs_from_sgr_parameters(params: &mut ParamsIter<'_>) -> Vec<Option<Attr>> {
                 let mut iter = params.map(|param| param[0]);
                 parse_sgr_color(&mut iter).map(Attr::Foreground)
             },
-            [38, params @ ..] => {
-                let rgb_start = if params.len() > 4 { 2 } else { 1 };
-                let rgb_iter = params[rgb_start..].iter().copied();
-                let mut iter = iter::once(params[0]).chain(rgb_iter);
-
-                parse_sgr_color(&mut iter).map(Attr::Foreground)
-            },
+            [38, params @ ..] => handle_colon_rgb(params).map(Attr::Foreground),
             [39] => Some(Attr::Foreground(Color::Named(NamedColor::Foreground))),
             [40] => Some(Attr::Background(Color::Named(NamedColor::Black))),
             [41] => Some(Attr::Background(Color::Named(NamedColor::Red))),
@@ -1362,14 +1417,16 @@ fn attrs_from_sgr_parameters(params: &mut ParamsIter<'_>) -> Vec<Option<Attr>> {
                 let mut iter = params.map(|param| param[0]);
                 parse_sgr_color(&mut iter).map(Attr::Background)
             },
-            [48, params @ ..] => {
-                let rgb_start = if params.len() > 4 { 2 } else { 1 };
-                let rgb_iter = params[rgb_start..].iter().copied();
-                let mut iter = iter::once(params[0]).chain(rgb_iter);
-
-                parse_sgr_color(&mut iter).map(Attr::Background)
-            },
+            [48, params @ ..] => handle_colon_rgb(params).map(Attr::Background),
             [49] => Some(Attr::Background(Color::Named(NamedColor::Background))),
+            [58] => {
+                let mut iter = params.map(|param| param[0]);
+                parse_sgr_color(&mut iter).map(|color| Attr::UnderlineColor(Some(color)))
+            },
+            [58, params @ ..] => {
+                handle_colon_rgb(params).map(|color| Attr::UnderlineColor(Some(color)))
+            },
+            [59] => Some(Attr::UnderlineColor(None)),
             [90] => Some(Attr::Foreground(Color::Named(NamedColor::BrightBlack))),
             [91] => Some(Attr::Foreground(Color::Named(NamedColor::BrightRed))),
             [92] => Some(Attr::Foreground(Color::Named(NamedColor::BrightGreen))),
@@ -1392,6 +1449,16 @@ fn attrs_from_sgr_parameters(params: &mut ParamsIter<'_>) -> Vec<Option<Attr>> {
     }
 
     attrs
+}
+
+/// Handle colon separated rgb color escape sequence.
+#[inline]
+fn handle_colon_rgb(params: &[u16]) -> Option<Color> {
+    let rgb_start = if params.len() > 4 { 2 } else { 1 };
+    let rgb_iter = params[rgb_start..].iter().copied();
+    let mut iter = iter::once(params[0]).chain(rgb_iter);
+
+    parse_sgr_color(&mut iter)
 }
 
 /// Parse a color specifier from list of attributes.
@@ -1492,6 +1559,8 @@ mod tests {
         charset: StandardCharset,
         attr: Option<Attr>,
         identity_reported: bool,
+        color: Option<Rgb>,
+        reset_colors: Vec<usize>,
     }
 
     impl Handler for MockHandler {
@@ -1515,6 +1584,14 @@ mod tests {
         fn reset_state(&mut self) {
             *self = Self::default();
         }
+
+        fn set_color(&mut self, _: usize, c: Rgb) {
+            self.color = Some(c);
+        }
+
+        fn reset_color(&mut self, index: usize) {
+            self.reset_colors.push(index)
+        }
     }
 
     impl Default for MockHandler {
@@ -1524,6 +1601,8 @@ mod tests {
                 charset: StandardCharset::Ascii,
                 attr: None,
                 identity_reported: false,
+                color: None,
+                reset_colors: Vec::new(),
             }
         }
     }
@@ -1721,5 +1800,63 @@ mod tests {
     #[test]
     fn parse_number_too_large() {
         assert_eq!(parse_number(b"321"), None);
+    }
+
+    #[test]
+    fn parse_osc4_set_color() {
+        let bytes: &[u8] = b"\x1b]4;0;#fff\x1b\\";
+
+        let mut parser = Processor::new();
+        let mut handler = MockHandler::default();
+
+        for byte in bytes {
+            parser.advance(&mut handler, *byte);
+        }
+
+        assert_eq!(handler.color, Some(Rgb { r: 0xf0, g: 0xf0, b: 0xf0 }));
+    }
+
+    #[test]
+    fn parse_osc104_reset_color() {
+        let bytes: &[u8] = b"\x1b]104;1;\x1b\\";
+
+        let mut parser = Processor::new();
+        let mut handler = MockHandler::default();
+
+        for byte in bytes {
+            parser.advance(&mut handler, *byte);
+        }
+
+        assert_eq!(handler.reset_colors, vec![1]);
+    }
+
+    #[test]
+    fn parse_osc104_reset_all_colors() {
+        let bytes: &[u8] = b"\x1b]104;\x1b\\";
+
+        let mut parser = Processor::new();
+        let mut handler = MockHandler::default();
+
+        for byte in bytes {
+            parser.advance(&mut handler, *byte);
+        }
+
+        let expected: Vec<usize> = (0..256).collect();
+        assert_eq!(handler.reset_colors, expected);
+    }
+
+    #[test]
+    fn parse_osc104_reset_all_colors_no_semicolon() {
+        let bytes: &[u8] = b"\x1b]104\x1b\\";
+
+        let mut parser = Processor::new();
+        let mut handler = MockHandler::default();
+
+        for byte in bytes {
+            parser.advance(&mut handler, *byte);
+        }
+
+        let expected: Vec<usize> = (0..256).collect();
+        assert_eq!(handler.reset_colors, expected);
     }
 }

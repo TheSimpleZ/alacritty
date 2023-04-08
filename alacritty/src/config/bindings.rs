@@ -3,14 +3,13 @@
 use std::fmt::{self, Debug, Display};
 
 use bitflags::bitflags;
-use glutin::event::VirtualKeyCode::*;
-use glutin::event::{ModifiersState, MouseButton, VirtualKeyCode};
-use serde::de::Error as SerdeError;
-use serde::de::{self, MapAccess, Unexpected, Visitor};
+use serde::de::{self, Error as SerdeError, MapAccess, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_yaml::Value as SerdeValue;
+use winit::event::VirtualKeyCode::*;
+use winit::event::{ModifiersState, MouseButton, VirtualKeyCode};
 
-use alacritty_config_derive::ConfigDeserialize;
+use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
 
 use alacritty_terminal::config::Program;
 use alacritty_terminal::term::TermMode;
@@ -109,6 +108,10 @@ pub enum Action {
     #[config(skip)]
     Search(SearchAction),
 
+    /// Perform mouse binding exclusive action.
+    #[config(skip)]
+    Mouse(MouseAction),
+
     /// Paste contents of system clipboard.
     Paste,
 
@@ -180,8 +183,14 @@ pub enum Action {
     /// Spawn a new instance of Alacritty.
     SpawnNewInstance,
 
+    /// Create a new Alacritty window.
+    CreateNewWindow,
+
     /// Toggle fullscreen.
     ToggleFullscreen,
+
+    /// Toggle maximized.
+    ToggleMaximized,
 
     /// Toggle simple fullscreen on macOS.
     #[cfg(target_os = "macos")]
@@ -230,12 +239,19 @@ impl From<SearchAction> for Action {
     }
 }
 
+impl From<MouseAction> for Action {
+    fn from(action: MouseAction) -> Self {
+        Self::Mouse(action)
+    }
+}
+
 /// Display trait used for error logging.
 impl Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Action::ViMotion(motion) => motion.fmt(f),
             Action::Vi(action) => action.fmt(f),
+            Action::Mouse(action) => action.fmt(f),
             _ => write!(f, "{:?}", self),
         }
     }
@@ -262,6 +278,8 @@ pub enum ViAction {
     SearchEnd,
     /// Launch the URL below the vi mode cursor.
     Open,
+    /// Centers the screen around the vi mode cursor.
+    CenterAroundViCursor,
 }
 
 /// Search mode specific actions.
@@ -284,6 +302,13 @@ pub enum SearchAction {
     SearchHistoryPrevious,
     /// Go to the next regex in the search history.
     SearchHistoryNext,
+}
+
+/// Mouse binding specific actions.
+#[derive(ConfigDeserialize, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MouseAction {
+    /// Expand the selection to the current mouse cursor position.
+    ExpandSelection,
 }
 
 macro_rules! bindings {
@@ -346,6 +371,8 @@ macro_rules! bindings {
 pub fn default_mouse_bindings() -> Vec<MouseBinding> {
     bindings!(
         MouseBinding;
+        MouseButton::Right;                         MouseAction::ExpandSelection;
+        MouseButton::Right,   ModifiersState::CTRL; MouseAction::ExpandSelection;
         MouseButton::Middle, ~BindingMode::VI; Action::PasteSelection;
     )
 }
@@ -476,6 +503,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
             ViAction::SearchPrevious;
         Return,                        +BindingMode::VI, ~BindingMode::SEARCH;
             ViAction::Open;
+        Z,                             +BindingMode::VI, ~BindingMode::SEARCH;
+            ViAction::CenterAroundViCursor;
         K,                             +BindingMode::VI, ~BindingMode::SEARCH;
             ViMotion::Up;
         J,                             +BindingMode::VI, ~BindingMode::SEARCH;
@@ -688,7 +717,7 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
             Action::Esc("\x0c".into());
         K, ModifiersState::LOGO, ~BindingMode::VI, ~BindingMode::SEARCH;  Action::ClearHistory;
         V, ModifiersState::LOGO, ~BindingMode::VI; Action::Paste;
-        N, ModifiersState::LOGO; Action::SpawnNewInstance;
+        N, ModifiersState::LOGO; Action::CreateNewWindow;
         F, ModifiersState::CTRL | ModifiersState::LOGO; Action::ToggleFullscreen;
         C, ModifiersState::LOGO; Action::Copy;
         C, ModifiersState::LOGO, +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
@@ -873,7 +902,7 @@ struct RawBinding {
 }
 
 impl RawBinding {
-    fn into_mouse_binding(self) -> Result<MouseBinding, Self> {
+    fn into_mouse_binding(self) -> Result<MouseBinding, Box<Self>> {
         if let Some(mouse) = self.mouse {
             Ok(Binding {
                 trigger: mouse,
@@ -883,11 +912,11 @@ impl RawBinding {
                 notmode: self.notmode,
             })
         } else {
-            Err(self)
+            Err(Box::new(self))
         }
     }
 
-    fn into_key_binding(self) -> Result<KeyBinding, Self> {
+    fn into_key_binding(self) -> Result<KeyBinding, Box<Self>> {
         if let Some(key) = self.key {
             Ok(KeyBinding {
                 trigger: key,
@@ -897,7 +926,7 @@ impl RawBinding {
                 notmode: self.notmode,
             })
         } else {
-            Err(self)
+            Err(Box::new(self))
         }
     }
 }
@@ -987,7 +1016,7 @@ impl<'a> Deserialize<'a> for RawBinding {
                             let val = map.next_value::<SerdeValue>()?;
                             if val.is_u64() {
                                 let scancode = val.as_u64().unwrap();
-                                if scancode > u64::from(std::u32::MAX) {
+                                if scancode > u64::from(u32::MAX) {
                                     return Err(<V::Error as Error>::custom(format!(
                                         "Invalid key binding, scancode too big: {}",
                                         scancode
@@ -1030,6 +1059,9 @@ impl<'a> Deserialize<'a> for RawBinding {
                                 SearchAction::deserialize(value.clone())
                             {
                                 Some(search_action.into())
+                            } else if let Ok(mouse_action) = MouseAction::deserialize(value.clone())
+                            {
+                                Some(mouse_action.into())
                             } else {
                                 match Action::deserialize(value.clone()).map_err(V::Error::custom) {
                                     Ok(action) => Some(action),
@@ -1081,7 +1113,7 @@ impl<'a> Deserialize<'a> for RawBinding {
 
                 let mode = mode.unwrap_or_else(BindingMode::empty);
                 let not_mode = not_mode.unwrap_or_else(BindingMode::empty);
-                let mods = mods.unwrap_or_else(ModifiersState::default);
+                let mods = mods.unwrap_or_default();
 
                 let action = match (action, chars, command) {
                     (Some(action @ Action::ViMotion(_)), None, None)
@@ -1105,13 +1137,22 @@ impl<'a> Deserialize<'a> for RawBinding {
                         }
                         action
                     },
+                    (Some(action @ Action::Mouse(_)), None, None) => {
+                        if mouse.is_none() {
+                            return Err(V::Error::custom(format!(
+                                "action `{}` is only available for mouse bindings",
+                                action,
+                            )));
+                        }
+                        action
+                    },
                     (Some(action), None, None) => action,
                     (None, Some(chars), None) => Action::Esc(chars),
                     (None, None, Some(cmd)) => Action::Command(cmd),
                     _ => {
                         return Err(V::Error::custom(
                             "must specify exactly one of chars, action or command",
-                        ))
+                        ));
                     },
                 };
 
@@ -1149,11 +1190,11 @@ impl<'a> Deserialize<'a> for KeyBinding {
     }
 }
 
-/// Newtype for implementing deserialize on glutin Mods.
+/// Newtype for implementing deserialize on winit Mods.
 ///
 /// Our deserialize impl wouldn't be covered by a derive(Deserialize); see the
 /// impl below.
-#[derive(Debug, Copy, Clone, Hash, Default, Eq, PartialEq)]
+#[derive(SerdeReplace, Debug, Copy, Clone, Hash, Default, Eq, PartialEq)]
 pub struct ModsWrapper(pub ModifiersState);
 
 impl ModsWrapper {
@@ -1204,7 +1245,7 @@ impl<'a> de::Deserialize<'a> for ModsWrapper {
 mod tests {
     use super::*;
 
-    use glutin::event::ModifiersState;
+    use winit::event::ModifiersState;
 
     type MockBinding = Binding<usize>;
 

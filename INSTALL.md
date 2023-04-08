@@ -9,6 +9,9 @@ install it directly through cargo:
 cargo install alacritty
 ```
 
+Note that you will still need to install the dependencies for your OS of choice.
+Please refer to the [Dependencies](#dependencies) section.
+
 # Manual Installation
 
 1. [Prerequisites](#prerequisites)
@@ -33,7 +36,7 @@ cargo install alacritty
         16. [Windows](#windows)
         17. [Other](#other)
 2. [Building](#building)
-    1. [Linux/Windows](#linux--windows)
+    1. [Linux/Windows/BSD](#linux--windows--bsd)
     2. [macOS](#macos)
 3. [Post Build](#post-build)
     1. [Terminfo](#terminfo)
@@ -81,7 +84,7 @@ to build Alacritty. Here's an apt command that should install all of them. If
 something is still found to be missing, please open an issue.
 
 ```sh
-apt-get install cmake pkg-config libfreetype6-dev libfontconfig1-dev libxcb-xfixes0-dev libxkbcommon-dev python3
+apt install cmake pkg-config libfreetype6-dev libfontconfig1-dev libxcb-xfixes0-dev libxkbcommon-dev python3
 ```
 
 #### Arch Linux
@@ -91,7 +94,7 @@ On Arch Linux, you need a few extra libraries to build Alacritty. Here's a
 to be missing, please open an issue.
 
 ```sh
-pacman -S cmake freetype2 fontconfig pkg-config make libxcb libxkbcommon
+pacman -S cmake freetype2 fontconfig pkg-config make libxcb libxkbcommon python
 ```
 
 #### Fedora
@@ -115,6 +118,17 @@ yum install cmake freetype-devel fontconfig-devel libxcb-devel libxkbcommon-deve
 yum group install "Development Tools"
 ```
 
+#### RHEL 8
+
+On RHEL 8, like RHEL 7, you need a few extra libraries to build Alacritty. Here's a `dnf`
+command that should install all of them. If something is still found to be
+missing, please open an issue.
+
+```sh
+dnf install cmake freetype-devel fontconfig-devel libxcb-devel libxkbcommon-devel
+dnf group install "Development Tools"
+```
+
 #### openSUSE
 
 On openSUSE, you need a few extra libraries to build Alacritty. Here's
@@ -122,7 +136,7 @@ a `zypper` command that should install all of them. If something is
 still found to be missing, please open an issue.
 
 ```sh
-zypper install cmake freetype-devel fontconfig-devel libxcb-devel
+zypper install cmake freetype-devel fontconfig-devel libxcb-devel libxkbcommon-devel
 ```
 
 #### Slackware
@@ -145,7 +159,7 @@ command that should install all of them. If something is still found to be
 missing, please open an issue.
 
 ```sh
-pkg install cmake freetype2 fontconfig pkgconf
+pkg install cmake freetype2 fontconfig pkgconf python3
 ```
 
 #### OpenBSD
@@ -233,10 +247,21 @@ filling in this section of the README.
 
 ## Building
 
-### Linux / Windows
+### Linux / Windows / BSD
 
 ```sh
 cargo build --release
+```
+
+On Linux/BSD, if it is desired to build Alacritty without support for either the
+X11 or Wayland rendering backend the following commands can be used.
+
+```sh
+# Force support for only Wayland
+cargo build --release --no-default-features --features=wayland
+
+# Force support for only X11
+cargo build --release --no-default-features --features=x11
 ```
 
 If all goes well, this should place a binary at `target/release/alacritty`.
@@ -246,6 +271,16 @@ If all goes well, this should place a binary at `target/release/alacritty`.
 ```sh
 make app
 cp -r target/release/osx/Alacritty.app /Applications/
+```
+
+#### Universal Binary
+
+The following will build an executable that runs on both x86 and ARM macos
+architectures:
+
+```sh
+rustup target add x86_64-apple-darwin aarch64-apple-darwin
+make app-universal
 ```
 
 ## Post Build
@@ -297,6 +332,7 @@ Installing the manual page requires the additional dependency `gzip`.
 ```sh
 sudo mkdir -p /usr/local/share/man/man1
 gzip -c extra/alacritty.man | sudo tee /usr/local/share/man/man1/alacritty.1.gz > /dev/null
+gzip -c extra/alacritty-msg.man | sudo tee /usr/local/share/man/man1/alacritty-msg.1.gz > /dev/null
 ```
 
 ### Shell completions
@@ -342,7 +378,7 @@ echo "source ~/.bash_completion/alacritty" >> ~/.bashrc
 
 #### Fish
 
-To install the completions for fish, run
+To install the completions for fish, from inside the fish shell, run
 
 ```
 mkdir -p $fish_complete_path[1]

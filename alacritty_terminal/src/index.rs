@@ -7,6 +7,8 @@ use std::ops::{Add, AddAssign, Deref, Sub, SubAssign};
 
 use serde::{Deserialize, Serialize};
 
+use alacritty_config_derive::SerdeReplace;
+
 use crate::grid::Dimensions;
 
 /// The side of a cell.
@@ -20,6 +22,7 @@ pub enum Direction {
 }
 
 impl Direction {
+    #[must_use]
     pub fn opposite(self) -> Self {
         match self {
             Side::Right => Side::Left,
@@ -133,6 +136,7 @@ pub struct Line(pub i32);
 
 impl Line {
     /// Clamp a line to a grid boundary.
+    #[must_use]
     pub fn grid_clamp<D: Dimensions>(self, dimensions: &D, boundary: Boundary) -> Self {
         match boundary {
             Boundary::Cursor => max(Line(0), min(dimensions.bottommost_line(), self)),
@@ -220,7 +224,19 @@ impl PartialEq<usize> for Line {
 /// A column.
 ///
 /// Newtype to avoid passing values incorrectly.
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq, Default, Ord, PartialOrd)]
+#[derive(
+    SerdeReplace,
+    Serialize,
+    Deserialize,
+    Debug,
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Default,
+    Ord,
+    PartialOrd,
+)]
 pub struct Column(pub usize);
 
 impl fmt::Display for Column {
